@@ -114,10 +114,15 @@ export function isProcessAlive(pid, options = {}) {
     if (looksLikeMissingProcessMessage(combinedOutput)) {
       return false;
     }
-    if (result.status !== 0) {
-      throw new Error(formatCommandFailure(result));
+    if (windowsTasklistOutputContainsPid(combinedOutput, normalizedPid)) {
+      return true;
     }
-    return windowsTasklistOutputContainsPid(combinedOutput, normalizedPid);
+    // Non-English Windows variants emit "no tasks found" messages that don't
+    // match looksLikeMissingProcessMessage and exit non-zero. If tasklist
+    // didn't surface the requested PID either way, treat it as absent rather
+    // than throwing — a throw here would leave dead jobs stuck in
+    // status:running forever (codex-plugin-cc-yr8).
+    return false;
   }
 
   return canSignalProcess(normalizedPid, killImpl);

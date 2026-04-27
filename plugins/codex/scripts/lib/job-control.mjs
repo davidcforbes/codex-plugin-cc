@@ -236,35 +236,30 @@ function isRunningJobStale(job, options = {}) {
 
 function markDeadRunningJobTerminated(workspaceRoot, job, options = {}) {
   const completedAt = new Date(options.nowMs ?? Date.now()).toISOString();
-  const nextJob = {
-    ...job,
+  const storedJob = readStoredJob(workspaceRoot, job.id);
+  const baseRecord = storedJob ?? job;
+  const terminatedRecord = {
+    ...baseRecord,
     status: "terminated",
     phase: "terminated",
     pid: null,
-    completedAt,
+    completedAt: baseRecord.completedAt ?? completedAt,
     updatedAt: completedAt,
-    errorMessage: job.errorMessage ?? DEAD_PID_MESSAGE
+    errorMessage: baseRecord.errorMessage ?? DEAD_PID_MESSAGE
   };
 
-  upsertJob(workspaceRoot, nextJob);
+  writeJobFile(workspaceRoot, job.id, terminatedRecord);
+  upsertJob(workspaceRoot, terminatedRecord);
 
-  const storedJob = readStoredJob(workspaceRoot, job.id);
-  if (storedJob) {
-    writeJobFile(workspaceRoot, job.id, {
-      ...storedJob,
-      status: "terminated",
-      phase: "terminated",
-      pid: null,
-      completedAt: storedJob.completedAt ?? completedAt,
-      updatedAt: completedAt,
-      errorMessage: storedJob.errorMessage ?? DEAD_PID_MESSAGE
-    });
-  }
-
-  return nextJob;
+  return terminatedRecord;
 }
 
 function refreshRunningJobLiveness(workspaceRoot, job, options = {}) {
+  // The OS-level liveness probe is throttled by isRunningJobStale (default
+  // DEFAULT_STALE_RUNNING_JOB_IDLE_MS = 60s) so we don't spawn tasklist /
+  // signal-zero on every /codex:status call against a healthy long-running
+  // job. Trade-off: a PID that dies seconds after its last log write will
+  // not flip to terminated until the throttle elapses.
   if (job.status !== "running" || job.pid == null || !isRunningJobStale(job, options)) {
     return job;
   }
