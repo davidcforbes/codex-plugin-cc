@@ -550,9 +550,29 @@ function applyTurnNotification(state, message) {
   }
 }
 
+function shouldCaptureNotification(state, message, { allowUnknownSubagent = false } = {}) {
+  if (message.method === "thread/started" || message.method === "thread/name/updated") {
+    return true;
+  }
+  if (belongsToTurn(state, message)) {
+    return true;
+  }
+  return (
+    allowUnknownSubagent &&
+    (message.method === "turn/started" || message.method === "turn/completed") &&
+    (message.params?.threadId ?? null) !== state.threadId
+  );
+}
+
+/**
+ * Captures one app-server streaming turn. A client can only have one capture
+ * in flight because it owns client.notificationHandler until completion.
+ */
 async function captureTurn(client, threadId, startRequest, options = {}) {
+  if (client.notificationHandler !== null) {
+    throw new Error("Cannot capture a Codex turn while another notification handler is active.");
+  }
   const state = createTurnCaptureState(threadId, options);
-  const previousHandler = client.notificationHandler;
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
@@ -560,19 +580,9 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       return;
     }
 
-    if (message.method === "thread/started" || message.method === "thread/name/updated") {
+    if (shouldCaptureNotification(state, message, { allowUnknownSubagent: true })) {
       applyTurnNotification(state, message);
-      return;
     }
-
-    if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
-    }
-
-    applyTurnNotification(state, message);
   });
 
   try {
@@ -583,12 +593,8 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
     for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
+      if (shouldCaptureNotification(state, message, { allowUnknownSubagent: true })) {
         applyTurnNotification(state, message);
-      } else {
-        if (previousHandler) {
-          previousHandler(message);
-        }
       }
     }
     state.bufferedNotifications.length = 0;
@@ -600,7 +606,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     return await state.completion;
   } finally {
     clearCompletionTimer(state);
-    client.setNotificationHandler(previousHandler ?? null);
+    client.setNotificationHandler(null);
   }
 }
 
@@ -789,6 +795,10 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   }
 }
 
+function isBrokerBusyAuthStatus(status) {
+  return status?.source === "app-server" && status?.loggedIn === false && /Shared Codex broker is busy/i.test(status.detail ?? "");
+}
+
 export function getCodexAvailability(cwd) {
   const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
   if (!versionStatus.available) {
@@ -849,8 +859,34 @@ export async function getCodexAuthStatus(cwd, options = {}) {
       env: options.env,
       reuseExistingBroker: true
     });
+    const status = await getCodexAuthStatusFromClient(client, cwd);
+    if (!isBrokerBusyAuthStatus(status)) {
+      return status;
+    }
+    await client.close().catch(() => {});
+    client = await CodexAppServerClient.connect(cwd, {
+      env: options.env,
+      disableBroker: true
+    });
     return await getCodexAuthStatusFromClient(client, cwd);
   } catch (error) {
+    if (error?.rpcCode === BROKER_BUSY_RPC_CODE) {
+      await client?.close().catch(() => {});
+      client = null;
+      try {
+        client = await CodexAppServerClient.connect(cwd, {
+          env: options.env,
+          disableBroker: true
+        });
+        return await getCodexAuthStatusFromClient(client, cwd);
+      } catch (directError) {
+        return buildAuthStatus({
+          loggedIn: false,
+          detail: directError instanceof Error ? directError.message : String(directError),
+          source: "app-server"
+        });
+      }
+    }
     return buildAuthStatus({
       loggedIn: false,
       detail: error instanceof Error ? error.message : String(error),

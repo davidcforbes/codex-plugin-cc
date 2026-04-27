@@ -178,7 +178,7 @@ function firstMeaningfulLine(text, fallback) {
 
 async function buildSetupReport(cwd, actionsTaken = []) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
+  const nodeStatus = { available: true, detail: process.version };
   const npmStatus = binaryAvailable("npm", ["--version"], { cwd });
   const codexStatus = getCodexAvailability(cwd);
   const authStatus = await getCodexAuthStatus(cwd);
@@ -610,9 +610,23 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
   };
 }
 
-function readTaskPrompt(cwd, options, positionals) {
+function isPathInside(parent, candidate) {
+  const relative = path.relative(parent, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function readContainedTextFile(cwd, workspaceRoot, filePath, label) {
+  const resolved = path.resolve(cwd, filePath);
+  const root = path.resolve(workspaceRoot);
+  if (!isPathInside(root, resolved)) {
+    throw new Error(`${label} must be inside the workspace root.`);
+  }
+  return fs.readFileSync(resolved, "utf8");
+}
+
+function readTaskPrompt(cwd, workspaceRoot, options, positionals) {
   if (options["prompt-file"]) {
-    return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
+    return readContainedTextFile(cwd, workspaceRoot, options["prompt-file"], "--prompt-file");
   }
 
   const positionalPrompt = positionals.join(" ");
@@ -630,7 +644,17 @@ async function runForegroundCommand(job, runner, options = {}) {
     logFile: options.logFile,
     stderr: !options.json
   });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  const execution = await runTrackedJob(
+    job,
+    async () => {
+      try {
+        return await runner(progress);
+      } finally {
+        progress?.flush?.();
+      }
+    },
+    { logFile }
+  );
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
@@ -661,6 +685,7 @@ function enqueueBackgroundTask(cwd, job, request) {
     status: "queued",
     phase: "queued",
     pid: child.pid ?? null,
+    processGroup: true,
     logFile,
     request
   };
@@ -742,7 +767,7 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
-  const prompt = readTaskPrompt(cwd, options, positionals);
+  const prompt = readTaskPrompt(cwd, workspaceRoot, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
@@ -828,11 +853,16 @@ async function handleTaskWorker(argv) {
       workspaceRoot,
       logFile
     },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
+    async () => {
+      try {
+        return await executeTaskRun({
+          ...request,
+          onProgress: progress
+        });
+      } finally {
+        progress?.flush?.();
+      }
+    },
     { logFile }
   );
 }
@@ -940,7 +970,7 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  terminateProcessTree(job.pid ?? Number.NaN, { processGroup: job.processGroup === true });
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();

@@ -4,6 +4,7 @@ import process from "node:process";
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+const PROGRESS_FLUSH_INTERVAL_MS = 500;
 
 export function nowIso() {
   return new Date().toISOString();
@@ -71,8 +72,43 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let pendingPatch = null;
+  let flushTimer = null;
 
-  return (event) => {
+  function flush() {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    if (!pendingPatch) {
+      return;
+    }
+
+    const patch = pendingPatch;
+    pendingPatch = null;
+    upsertJob(workspaceRoot, patch);
+
+    const jobFile = resolveJobFile(workspaceRoot, jobId);
+    if (!fs.existsSync(jobFile)) {
+      return;
+    }
+
+    const storedJob = readJobFile(jobFile);
+    writeJobFile(workspaceRoot, jobId, {
+      ...storedJob,
+      ...patch
+    });
+  }
+
+  function scheduleFlush() {
+    if (flushTimer) {
+      return;
+    }
+    flushTimer = setTimeout(flush, PROGRESS_FLUSH_INTERVAL_MS);
+    flushTimer.unref?.();
+  }
+
+  const update = (event) => {
     const normalized = normalizeProgressEvent(event);
     const patch = { id: jobId };
     let changed = false;
@@ -99,19 +135,15 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
-    }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
+    pendingPatch = {
+      ...(pendingPatch ?? { id: jobId }),
       ...patch
-    });
+    };
+    scheduleFlush();
   };
+
+  update.flush = flush;
+  return update;
 }
 
 export function createProgressReporter({ stderr = false, logFile = null, onEvent = null } = {}) {
@@ -119,7 +151,7 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     return null;
   }
 
-  return (eventOrMessage) => {
+  const report = (eventOrMessage) => {
     const event = normalizeProgressEvent(eventOrMessage);
     const stderrMessage = event.stderrMessage ?? event.message;
     if (stderr && stderrMessage) {
@@ -129,6 +161,8 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     appendLogBlock(logFile, event.logTitle, event.logBody);
     onEvent?.(event);
   };
+  report.flush = () => onEvent?.flush?.();
+  return report;
 }
 
 function readStoredJobOrNull(workspaceRoot, jobId) {

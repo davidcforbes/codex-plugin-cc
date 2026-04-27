@@ -9,8 +9,12 @@ const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
+const STATE_LOCK_FILE_NAME = "state.lock";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const STATE_LOCK_TIMEOUT_MS = 15000;
+const STATE_LOCK_STALE_MS = 60000;
+const stateDirCache = new Map();
 
 function nowIso() {
   return new Date().toISOString();
@@ -27,6 +31,13 @@ function defaultState() {
 }
 
 export function resolveStateDir(cwd) {
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV] ?? "";
+  const cacheKey = `${path.resolve(cwd)}\0${pluginDataDir}`;
+  const cached = stateDirCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
@@ -38,9 +49,10 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
   const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  const stateDir = path.join(stateRoot, `${slug}-${hash}`);
+  stateDirCache.set(cacheKey, stateDir);
+  return stateDir;
 }
 
 export function resolveStateFile(cwd) {
@@ -55,7 +67,68 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
-export function loadState(cwd) {
+function sleepSync(ms) {
+  const buffer = new SharedArrayBuffer(4);
+  const view = new Int32Array(buffer);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+function resolveStateLockFile(cwd) {
+  return path.join(resolveStateDir(cwd), STATE_LOCK_FILE_NAME);
+}
+
+function withStateLock(cwd, fn) {
+  fs.mkdirSync(resolveStateDir(cwd), { recursive: true });
+  const lockFile = resolveStateLockFile(cwd);
+  const start = Date.now();
+  let fd = null;
+
+  while (fd === null) {
+    try {
+      fd = fs.openSync(lockFile, "wx");
+      fs.writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+    } catch (error) {
+      if (error?.code !== "EEXIST" && error?.code !== "EPERM") {
+        throw error;
+      }
+      try {
+        const stats = fs.statSync(lockFile);
+        if (Date.now() - stats.mtimeMs > STATE_LOCK_STALE_MS) {
+          fs.unlinkSync(lockFile);
+          continue;
+        }
+      } catch (statError) {
+        if (statError?.code !== "ENOENT") {
+          throw statError;
+        }
+        if (Date.now() - start > STATE_LOCK_TIMEOUT_MS) {
+          throw new Error(`Timed out waiting for state lock: ${lockFile}`);
+        }
+        sleepSync(25);
+        continue;
+      }
+      if (Date.now() - start > STATE_LOCK_TIMEOUT_MS) {
+        throw new Error(`Timed out waiting for state lock: ${lockFile}`);
+      }
+      sleepSync(25);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    fs.closeSync(fd);
+    try {
+      fs.unlinkSync(lockFile);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+}
+
+function loadStateUnlocked(cwd) {
   const stateFile = resolveStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
     return defaultState();
@@ -77,6 +150,10 @@ export function loadState(cwd) {
   }
 }
 
+export function loadState(cwd) {
+  return loadStateUnlocked(cwd);
+}
+
 function pruneJobs(jobs) {
   return [...jobs]
     .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
@@ -89,8 +166,25 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
+function writeFileAtomic(filePath, contents) {
+  const tempFile = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    fs.writeFileSync(tempFile, contents, "utf8");
+    fs.renameSync(tempFile, filePath);
+  } catch (error) {
+    try {
+      if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+      }
+    } catch {
+      // Ignore cleanup failures for best-effort temp file removal.
+    }
+    throw error;
+  }
+}
+
+function saveStateUnlocked(cwd, state) {
+  const previousJobs = loadStateUnlocked(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
@@ -111,14 +205,20 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadStateUnlocked(cwd);
+    mutate(state);
+    return saveStateUnlocked(cwd, state);
+  });
+}
+
+export function saveState(cwd, state) {
+  return withStateLock(cwd, () => saveStateUnlocked(cwd, state));
 }
 
 export function generateJobId(prefix = "job") {
@@ -127,20 +227,24 @@ export function generateJobId(prefix = "job") {
 }
 
 export function upsertJob(cwd, jobPatch) {
+  const safeJobPatch = {
+    ...jobPatch,
+    id: assertSafeJobId(jobPatch.id)
+  };
   return updateState(cwd, (state) => {
     const timestamp = nowIso();
-    const existingIndex = state.jobs.findIndex((job) => job.id === jobPatch.id);
+    const existingIndex = state.jobs.findIndex((job) => job.id === safeJobPatch.id);
     if (existingIndex === -1) {
       state.jobs.unshift({
         createdAt: timestamp,
         updatedAt: timestamp,
-        ...jobPatch
+        ...safeJobPatch
       });
       return;
     }
     state.jobs[existingIndex] = {
       ...state.jobs[existingIndex],
-      ...jobPatch,
+      ...safeJobPatch,
       updatedAt: timestamp
     };
   });
@@ -166,7 +270,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeFileAtomic(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 
@@ -180,12 +284,26 @@ function removeJobFile(jobFile) {
   }
 }
 
+function assertSafeJobId(jobId) {
+  const value = String(jobId ?? "");
+  if (
+    !value ||
+    value !== path.basename(value) ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    value.includes("..")
+  ) {
+    throw new Error(`Invalid job id: ${value || "<empty>"}`);
+  }
+  return value;
+}
+
 export function resolveJobLogFile(cwd, jobId) {
   ensureStateDir(cwd);
-  return path.join(resolveJobsDir(cwd), `${jobId}.log`);
+  return path.join(resolveJobsDir(cwd), `${assertSafeJobId(jobId)}.log`);
 }
 
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
-  return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+  return path.join(resolveJobsDir(cwd), `${assertSafeJobId(jobId)}.json`);
 }

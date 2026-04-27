@@ -173,7 +173,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
   if (Number.isFinite(pid) && killProcess) {
     try {
-      killProcess(pid);
+      killProcess(pid, { processGroup: true });
     } catch {
       // Ignore missing or already-exited broker processes.
     }

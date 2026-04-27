@@ -9,7 +9,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
     windowsHide: true
   });
 
@@ -66,7 +66,11 @@ export function terminateProcessTree(pid, options = {}) {
   if (platform === "win32") {
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: {
+        ...(options.env ?? process.env),
+        MSYS_NO_PATHCONV: "1"
+      },
+      shell: false
     });
 
     if (!result.error && result.status === 0) {
@@ -97,11 +101,14 @@ export function terminateProcessTree(pid, options = {}) {
     throw new Error(formatCommandFailure(result));
   }
 
-  try {
-    killImpl(-pid, "SIGTERM");
-    return { attempted: true, delivered: true, method: "process-group" };
-  } catch (error) {
-    if (error?.code !== "ESRCH") {
+  if (options.processGroup === true) {
+    try {
+      killImpl(-pid, "SIGTERM");
+      return { attempted: true, delivered: true, method: "process-group" };
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process-group" };
+      }
       try {
         killImpl(pid, "SIGTERM");
         return { attempted: true, delivered: true, method: "process" };
@@ -112,8 +119,16 @@ export function terminateProcessTree(pid, options = {}) {
         throw innerError;
       }
     }
+  }
 
-    return { attempted: true, delivered: false, method: "process-group" };
+  try {
+    killImpl(pid, "SIGTERM");
+    return { attempted: true, delivered: true, method: "process" };
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return { attempted: true, delivered: false, method: "process" };
+    }
+    throw error;
   }
 }
 

@@ -580,6 +580,20 @@ test("write task output focuses on the Codex result without generic follow-up hi
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("task rejects prompt files outside the workspace root", () => {
+  const workspace = makeTempDir();
+  const outsideDir = makeTempDir();
+  const outsidePrompt = path.join(outsideDir, "prompt.txt");
+  fs.writeFileSync(outsidePrompt, "steal this\n", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", outsidePrompt], {
+    cwd: workspace
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--prompt-file must be inside the workspace root/);
+});
+
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

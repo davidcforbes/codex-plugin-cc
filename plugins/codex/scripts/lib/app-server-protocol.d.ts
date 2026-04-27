@@ -52,6 +52,8 @@ export interface CodexAppServerClientOptions {
   brokerEndpoint?: string;
   disableBroker?: boolean;
   reuseExistingBroker?: boolean;
+  maxLineBytes?: number;
+  requestTimeoutMs?: number;
 }
 
 export interface AppServerMethodMap {

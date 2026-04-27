@@ -10,6 +10,7 @@ import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const MAX_JSON_RPC_LINE_BYTES = 64 * 1024 * 1024;
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -122,6 +123,15 @@ async function main() {
 
     socket.on("data", async (chunk) => {
       buffer += chunk;
+      if (buffer.length > MAX_JSON_RPC_LINE_BYTES && !buffer.includes("\n")) {
+        send(socket, {
+          id: null,
+          error: buildJsonRpcError(-32700, `JSON-RPC line exceeded ${MAX_JSON_RPC_LINE_BYTES} bytes.`)
+        });
+        socket.destroy();
+        return;
+      }
+
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
         const line = buffer.slice(0, newlineIndex);
@@ -130,6 +140,14 @@ async function main() {
 
         if (!line.trim()) {
           continue;
+        }
+        if (line.length > MAX_JSON_RPC_LINE_BYTES) {
+          send(socket, {
+            id: null,
+            error: buildJsonRpcError(-32700, `JSON-RPC line exceeded ${MAX_JSON_RPC_LINE_BYTES} bytes.`)
+          });
+          socket.destroy();
+          return;
         }
 
         let message;
@@ -167,21 +185,7 @@ async function main() {
           continue;
         }
 
-        const allowInterruptDuringActiveStream =
-          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
-
-        if (
-          ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
-          !allowInterruptDuringActiveStream
-        ) {
-          send(socket, {
-            id: message.id,
-            error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Shared Codex broker is busy.")
-          });
-          continue;
-        }
-
-        if (allowInterruptDuringActiveStream) {
+        if (isInterruptRequest(message)) {
           try {
             const result = await appClient.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
@@ -191,6 +195,17 @@ async function main() {
               error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
             });
           }
+          continue;
+        }
+
+        if (
+          (activeRequestSocket && activeRequestSocket !== socket) ||
+          (activeStreamSocket && activeStreamSocket !== socket)
+        ) {
+          send(socket, {
+            id: message.id,
+            error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Shared Codex broker is busy.")
+          });
           continue;
         }
 

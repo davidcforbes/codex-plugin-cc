@@ -575,7 +575,8 @@ rl.on("line", (line) => {
   // On Windows, npm global binaries are invoked via .cmd wrappers.
   // Create a codex.cmd so the fake binary is discoverable by spawn with shell: true.
   if (process.platform === "win32") {
-    const cmdWrapper = `@echo off\r\nnode "%~dp0codex" %*\r\n`;
+    const nodeExe = process.execPath.replace(/"/g, '""');
+    const cmdWrapper = `@echo off\r\n"${nodeExe}" "%~dp0codex" %*\r\n`;
     fs.writeFileSync(path.join(binDir, "codex.cmd"), cmdWrapper, { encoding: "utf8" });
   }
 }

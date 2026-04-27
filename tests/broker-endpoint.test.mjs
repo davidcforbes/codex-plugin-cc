@@ -6,7 +6,7 @@ import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scri
 test("createBrokerEndpoint uses Unix sockets on non-Windows platforms", () => {
   const endpoint = createBrokerEndpoint("/tmp/cxc-12345", "darwin");
   assert.equal(endpoint, "unix:/tmp/cxc-12345/broker.sock");
-  assert.deepEqual(parseBrokerEndpoint(endpoint), {
+  assert.deepEqual(parseBrokerEndpoint(endpoint, { platform: "darwin", allowedUnixSocketRoots: ["/tmp"] }), {
     kind: "unix",
     path: "/tmp/cxc-12345/broker.sock"
   });
@@ -19,4 +19,18 @@ test("createBrokerEndpoint uses named pipes on Windows", () => {
     kind: "pipe",
     path: "\\\\.\\pipe\\cxc-12345-codex-app-server"
   });
+});
+
+test("parseBrokerEndpoint rejects Unix sockets outside allowed roots", () => {
+  assert.throws(
+    () => parseBrokerEndpoint("unix:/var/run/attacker.sock", { platform: "linux", allowedUnixSocketRoots: ["/tmp"] }),
+    /must be under/
+  );
+});
+
+test("parseBrokerEndpoint rejects relative Unix socket paths", () => {
+  assert.throws(
+    () => parseBrokerEndpoint("unix:relative/broker.sock", { platform: "linux", allowedUnixSocketRoots: ["/tmp"] }),
+    /must be absolute/
+  );
 });

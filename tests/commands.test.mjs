@@ -119,9 +119,12 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /If the user chooses continue, add `--resume`/i);
   assert.match(rescue, /If the user chooses a new thread, add `--fresh`/i);
   assert.match(rescue, /thin forwarder only/i);
+  assert.match(rescue, /```bash\s*node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" task "\$ARGUMENTS"\s*```/);
   assert.match(rescue, /Return the Codex companion stdout verbatim to the user/i);
   assert.match(rescue, /Do not paraphrase, summarize, rewrite, or add commentary before or after it/i);
   assert.match(rescue, /return that command's stdout as-is/i);
+  assert.match(rescue, /Do not add `--write` for diagnosis, research, planning, or review-only requests/i);
+  assert.match(rescue, /Add `--write` only when the user explicitly asks Codex to edit, fix, implement/i);
   assert.match(rescue, /Leave `--resume` and `--fresh` in the forwarded request/i);
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
@@ -133,6 +136,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
   assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
   assert.match(agent, /Leave model unset by default/i);
+  assert.match(agent, /Default to read-only/i);
+  assert.match(agent, /Add `--write` only when the user explicitly asks Codex to edit, fix, implement/i);
   assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
   assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
   assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
@@ -147,6 +152,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
+  assert.match(runtimeSkill, /Default to read-only/i);
+  assert.match(runtimeSkill, /Add `--write` only when the user explicitly asks Codex to edit, fix, implement/i);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);

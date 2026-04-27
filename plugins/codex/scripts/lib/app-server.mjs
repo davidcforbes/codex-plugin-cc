@@ -11,23 +11,39 @@ import fs from "node:fs";
 import net from "node:net";
 import process from "node:process";
 import { spawn } from "node:child_process";
-import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
-const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
+const DEFAULT_MAX_JSON_RPC_LINE_BYTES = 64 * 1024 * 1024;
+const DEFAULT_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+let pluginVersion = null;
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
-/** @type {ClientInfo} */
-const DEFAULT_CLIENT_INFO = {
-  title: "Codex Plugin",
-  name: "Claude Code",
-  version: PLUGIN_MANIFEST.version ?? "0.0.0"
-};
+function getPluginVersion() {
+  if (pluginVersion !== null) {
+    return pluginVersion;
+  }
+  try {
+    const manifest = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
+    pluginVersion = manifest.version ?? "0.0.0";
+  } catch {
+    pluginVersion = "0.0.0";
+  }
+  return pluginVersion;
+}
+
+/** @returns {ClientInfo} */
+function defaultClientInfo() {
+  return {
+    title: "Codex Plugin",
+    name: "Claude Code",
+    version: getPluginVersion()
+  };
+}
 
 /** @type {InitializeCapabilities} */
 const DEFAULT_CAPABILITIES = {
@@ -65,6 +81,8 @@ class AppServerClientBase {
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
     this.lineBuffer = "";
+    this.maxLineBytes = options.maxLineBytes ?? DEFAULT_MAX_JSON_RPC_LINE_BYTES;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.transport = "unknown";
 
     this.exitPromise = new Promise((resolve) => {
@@ -91,7 +109,20 @@ class AppServerClientBase {
     this.nextId += 1;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+      let timer = null;
+      if (Number.isFinite(this.requestTimeoutMs) && this.requestTimeoutMs > 0) {
+        timer = setTimeout(() => {
+          const pending = this.pending.get(id);
+          if (!pending) {
+            return;
+          }
+          const error = createProtocolError(`codex app-server ${method} timed out after ${this.requestTimeoutMs}ms.`);
+          this.handleExit(error);
+          this.destroyTransport(error);
+        }, this.requestTimeoutMs);
+        timer.unref?.();
+      }
+      this.pending.set(id, { resolve, reject, method, timer });
       this.sendMessage({ id, method, params });
     });
   }
@@ -105,10 +136,23 @@ class AppServerClientBase {
 
   handleChunk(chunk) {
     this.lineBuffer += chunk;
+    if (this.lineBuffer.length > this.maxLineBytes && !this.lineBuffer.includes("\n")) {
+      const error = createProtocolError(`codex app-server JSON-RPC line exceeded ${this.maxLineBytes} bytes.`);
+      this.handleExit(error);
+      this.destroyTransport(error);
+      return;
+    }
+
     let newlineIndex = this.lineBuffer.indexOf("\n");
     while (newlineIndex !== -1) {
       const line = this.lineBuffer.slice(0, newlineIndex);
       this.lineBuffer = this.lineBuffer.slice(newlineIndex + 1);
+      if (line.length > this.maxLineBytes) {
+        const error = createProtocolError(`codex app-server JSON-RPC line exceeded ${this.maxLineBytes} bytes.`);
+        this.handleExit(error);
+        this.destroyTransport(error);
+        return;
+      }
       this.handleLine(line);
       newlineIndex = this.lineBuffer.indexOf("\n");
     }
@@ -138,6 +182,9 @@ class AppServerClientBase {
         return;
       }
       this.pending.delete(message.id);
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
 
       if (message.error) {
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
@@ -168,6 +215,9 @@ class AppServerClientBase {
     this.exitError = error ?? null;
 
     for (const pending of this.pending.values()) {
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
       pending.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
     this.pending.clear();
@@ -177,6 +227,8 @@ class AppServerClientBase {
   sendMessage(_message) {
     throw new Error("sendMessage must be implemented by subclasses.");
   }
+
+  destroyTransport(_error) {}
 }
 
 class SpawnedCodexAppServerClient extends AppServerClientBase {
@@ -213,13 +265,12 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleExit(detail);
     });
 
-    this.readline = readline.createInterface({ input: this.proc.stdout });
-    this.readline.on("line", (line) => {
-      this.handleLine(line);
+    this.proc.stdout.on("data", (chunk) => {
+      this.handleChunk(chunk);
     });
 
     await this.request("initialize", {
-      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
+      clientInfo: this.options.clientInfo ?? defaultClientInfo(),
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
     });
     this.notify("initialized", {});
@@ -232,10 +283,6 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
 
     this.closed = true;
-
-    if (this.readline) {
-      this.readline.close();
-    }
 
     if (this.proc && !this.proc.killed) {
       this.proc.stdin.end();
@@ -269,6 +316,12 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
     stdin.write(line);
   }
+
+  destroyTransport() {
+    if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
+      this.proc.kill("SIGTERM");
+    }
+  }
 }
 
 class BrokerCodexAppServerClient extends AppServerClientBase {
@@ -299,7 +352,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     });
 
     await this.request("initialize", {
-      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
+      clientInfo: this.options.clientInfo ?? defaultClientInfo(),
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
     });
     this.notify("initialized", {});
@@ -325,6 +378,10 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
       throw new Error("codex app-server broker connection is not connected.");
     }
     socket.write(line);
+  }
+
+  destroyTransport(error) {
+    this.socket?.destroy(error);
   }
 }
 
