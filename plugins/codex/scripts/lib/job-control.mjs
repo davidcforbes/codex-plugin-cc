@@ -1,12 +1,16 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { isProcessAlive } from "./process.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+export const DEFAULT_STALE_RUNNING_JOB_IDLE_MS = 60 * 1000;
+
+const DEAD_PID_MESSAGE = "Detected dead PID; auto-marked terminated.";
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -110,6 +114,8 @@ function inferLegacyJobPhase(job, progressPreview = []) {
   switch (job.status) {
     case "queued":
       return "queued";
+    case "terminated":
+      return "terminated";
     case "cancelled":
       return "cancelled";
     case "failed":
@@ -169,7 +175,7 @@ export function enrichJob(job, options = {}) {
         : [],
     elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),
     duration:
-      job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+      job.status === "completed" || job.status === "failed" || job.status === "cancelled" || job.status === "terminated"
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
         : null
   };
@@ -186,6 +192,101 @@ export function readStoredJob(workspaceRoot, jobId) {
     return null;
   }
   return readJobFile(jobFile);
+}
+
+function parseTimeMs(value) {
+  const parsed = Date.parse(value ?? "");
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function readLogMtimeMs(logFile) {
+  if (!logFile || !fs.existsSync(logFile)) {
+    return null;
+  }
+  try {
+    return fs.statSync(logFile).mtimeMs;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function getLatestActivityMs(job) {
+  return Math.max(
+    ...[
+      parseTimeMs(job.updatedAt),
+      parseTimeMs(job.startedAt),
+      parseTimeMs(job.createdAt),
+      readLogMtimeMs(job.logFile)
+    ].filter((value) => Number.isFinite(value))
+  );
+}
+
+function isRunningJobStale(job, options = {}) {
+  const nowMs = options.nowMs ?? Date.now();
+  const thresholdMs = options.staleRunningJobIdleMs ?? DEFAULT_STALE_RUNNING_JOB_IDLE_MS;
+  const latestActivityMs = getLatestActivityMs(job);
+  if (!Number.isFinite(latestActivityMs)) {
+    return true;
+  }
+  return nowMs - latestActivityMs >= thresholdMs;
+}
+
+function markDeadRunningJobTerminated(workspaceRoot, job, options = {}) {
+  const completedAt = new Date(options.nowMs ?? Date.now()).toISOString();
+  const nextJob = {
+    ...job,
+    status: "terminated",
+    phase: "terminated",
+    pid: null,
+    completedAt,
+    updatedAt: completedAt,
+    errorMessage: job.errorMessage ?? DEAD_PID_MESSAGE
+  };
+
+  upsertJob(workspaceRoot, nextJob);
+
+  const storedJob = readStoredJob(workspaceRoot, job.id);
+  if (storedJob) {
+    writeJobFile(workspaceRoot, job.id, {
+      ...storedJob,
+      status: "terminated",
+      phase: "terminated",
+      pid: null,
+      completedAt: storedJob.completedAt ?? completedAt,
+      updatedAt: completedAt,
+      errorMessage: storedJob.errorMessage ?? DEAD_PID_MESSAGE
+    });
+  }
+
+  return nextJob;
+}
+
+function refreshRunningJobLiveness(workspaceRoot, job, options = {}) {
+  if (job.status !== "running" || job.pid == null || !isRunningJobStale(job, options)) {
+    return job;
+  }
+
+  let alive = true;
+  try {
+    alive = isProcessAlive(job.pid, {
+      cwd: workspaceRoot,
+      env: options.env,
+      killImpl: options.killImpl,
+      platform: options.platform,
+      runCommandImpl: options.runCommandImpl
+    });
+  } catch {
+    return job;
+  }
+
+  return alive ? job : markDeadRunningJobTerminated(workspaceRoot, job, options);
+}
+
+function listJobsWithLiveness(workspaceRoot, options = {}) {
+  return listJobs(workspaceRoot).map((job) => refreshRunningJobLiveness(workspaceRoot, job, options));
 }
 
 function matchJobReference(jobs, reference, predicate = () => true) {
@@ -213,7 +314,7 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobsWithLiveness(workspaceRoot, options), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -241,7 +342,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(listJobsWithLiveness(workspaceRoot, options));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
@@ -255,11 +356,17 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  const jobs = sortJobsNewestFirst(
+    reference ? listJobsWithLiveness(workspaceRoot) : filterJobsForCurrentSession(listJobsWithLiveness(workspaceRoot))
+  );
   const selected = matchJobReference(
     jobs,
     reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+    (job) =>
+      job.status === "completed" ||
+      job.status === "failed" ||
+      job.status === "cancelled" ||
+      job.status === "terminated"
   );
 
   if (selected) {
@@ -280,7 +387,7 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(listJobsWithLiveness(workspaceRoot, options));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {

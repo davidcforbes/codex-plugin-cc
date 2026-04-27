@@ -15,6 +15,7 @@ const MAX_JOBS = 50;
 const STATE_LOCK_TIMEOUT_MS = 15000;
 const STATE_LOCK_STALE_MS = 60000;
 const stateDirCache = new Map();
+let stateLockDepth = 0;
 
 function nowIso() {
   return new Date().toISOString();
@@ -114,9 +115,11 @@ function withStateLock(cwd, fn) {
     }
   }
 
+  stateLockDepth += 1;
   try {
     return fn();
   } finally {
+    stateLockDepth -= 1;
     fs.closeSync(fd);
     try {
       fs.unlinkSync(lockFile);
@@ -184,6 +187,11 @@ function writeFileAtomic(filePath, contents) {
 }
 
 function saveStateUnlocked(cwd, state) {
+  // The re-read below is part of the lock-protected critical section, so
+  // artifact pruning observes a stable prior state before the atomic rename.
+  if (stateLockDepth <= 0) {
+    throw new Error("saveStateUnlocked must be called while holding the state lock.");
+  }
   const previousJobs = loadStateUnlocked(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);

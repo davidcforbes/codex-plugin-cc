@@ -436,6 +436,58 @@ test("task-resume-candidate returns the latest rescue thread from the current se
   assert.equal(payload.candidate.threadId, "thr_current");
 });
 
+test("task-resume-candidate filters sandbox-blocked and empty task runs", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-blocked",
+            status: "failed",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-current",
+            threadId: "thr_blocked",
+            summary: "rejected: blocked by policy in sandbox",
+            updatedAt: "2026-03-24T20:10:00.000Z"
+          },
+          {
+            id: "task-empty",
+            status: "completed",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-current",
+            threadId: "thr_empty",
+            updatedAt: "2026-03-24T20:00:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).available, false);
+});
+
 test("task --resume-last does not resume a task from another Claude session", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1036,6 +1088,79 @@ test("status shows phases, hints, and the latest finished job", () => {
   assert.match(result.stdout, /Duration: 1m 5s/);
   assert.match(result.stdout, /Codex session ID: thr_done/);
   assert.match(result.stdout, /Resume in Codex: codex resume thr_done/);
+});
+
+test("status marks stale running jobs with dead PIDs as terminated", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const staleAt = new Date(Date.now() - 120_000);
+  const logFile = path.join(jobsDir, "task-dead.log");
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+  fs.utimesSync(logFile, staleAt, staleAt);
+  fs.writeFileSync(
+    path.join(jobsDir, "task-dead.json"),
+    JSON.stringify(
+      {
+        id: "task-dead",
+        status: "running",
+        title: "Codex Task",
+        logFile
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-dead",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            pid: 987654321,
+            summary: "Investigate flaky test",
+            logFile,
+            createdAt: staleAt.toISOString(),
+            startedAt: staleAt.toISOString(),
+            updatedAt: staleAt.toISOString()
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "status", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.running, []);
+  assert.equal(payload.latestFinished.id, "task-dead");
+  assert.equal(payload.latestFinished.status, "terminated");
+  assert.match(payload.latestFinished.errorMessage, /Detected dead PID/);
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "terminated");
+  assert.equal(state.jobs[0].pid, null);
+  assert.match(state.jobs[0].errorMessage, /Detected dead PID/);
+
+  const storedJob = JSON.parse(fs.readFileSync(path.join(jobsDir, "task-dead.json"), "utf8"));
+  assert.equal(storedJob.status, "terminated");
+  assert.match(storedJob.errorMessage, /Detected dead PID/);
 });
 
 test("status without a job id only shows jobs from the current Claude session", () => {

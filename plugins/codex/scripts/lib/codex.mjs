@@ -1065,6 +1065,8 @@ export async function runAppServerTurn(cwd, options = {}) {
 }
 
 export async function findLatestTaskThread(cwd) {
+  // Tracked task resume candidates are filtered in codex-companion.mjs before
+  // this app-server fallback, excluding empty outputs and hard environment refusals.
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");

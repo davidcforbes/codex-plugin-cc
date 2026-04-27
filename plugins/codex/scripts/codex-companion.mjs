@@ -68,6 +68,16 @@ const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
+const NON_RESUMABLE_TASK_OUTPUT_PATTERNS = [
+  /blocked by policy/i,
+  /\bsandbox(?:ed)?\b/i,
+  /permission denied/i,
+  /command not found/i,
+  /missing tool/i,
+  /not authenticated/i,
+  /authentication (?:failed|expired)/i,
+  /\bauth(?:entication)? failure\b/i
+];
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -300,15 +310,41 @@ function filterJobsForCurrentClaudeSession(jobs) {
   return jobs.filter((job) => job.sessionId === sessionId);
 }
 
-function findLatestResumableTaskJob(jobs) {
+function collectTaskResumeSignal(job, workspaceRoot) {
+  const storedJob = workspaceRoot && job.id ? readStoredJob(workspaceRoot, job.id) : null;
+  return [
+    job.summary,
+    job.errorMessage,
+    storedJob?.summary,
+    storedJob?.errorMessage,
+    storedJob?.rendered,
+    storedJob?.result?.rawOutput,
+    storedJob?.result?.failureMessage,
+    storedJob?.result?.codex?.stdout,
+    storedJob?.result?.codex?.stderr
+  ]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join("\n");
+}
+
+function isResumableTaskJob(job, workspaceRoot) {
+  if (job.jobClass !== "task" || !job.threadId || job.status === "queued" || job.status === "running") {
+    return false;
+  }
+
+  // Resume prompts are only useful for task runs that produced actionable thread
+  // state. Environment refusals and empty outputs resume into no-op dead ends.
+  const signal = collectTaskResumeSignal(job, workspaceRoot);
+  if (!signal.trim()) {
+    return false;
+  }
+  return !NON_RESUMABLE_TASK_OUTPUT_PATTERNS.some((pattern) => pattern.test(signal));
+}
+
+function findLatestResumableTaskJob(jobs, options = {}) {
+  const workspaceRoot = options.workspaceRoot ?? null;
   return (
-    jobs.find(
-      (job) =>
-        job.jobClass === "task" &&
-        job.threadId &&
-        job.status !== "queued" &&
-        job.status !== "running"
-    ) ?? null
+    jobs.find((job) => isResumableTaskJob(job, workspaceRoot)) ?? null
   );
 }
 
@@ -340,7 +376,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
   }
 
-  const trackedTask = findLatestResumableTaskJob(visibleJobs);
+  const trackedTask = findLatestResumableTaskJob(visibleJobs, { workspaceRoot });
   if (trackedTask) {
     return { id: trackedTask.threadId };
   }
@@ -922,7 +958,7 @@ function handleTaskResumeCandidate(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
   const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
-  const candidate = findLatestResumableTaskJob(jobs);
+  const candidate = findLatestResumableTaskJob(jobs, { workspaceRoot });
 
   const payload = {
     available: Boolean(candidate),

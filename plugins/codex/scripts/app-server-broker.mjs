@@ -35,7 +35,7 @@ function send(socket, message) {
 }
 
 function isInterruptRequest(message) {
-  return message?.method === "turn/interrupt";
+  return message?.method === "turn/interrupt" && message?.id !== undefined;
 }
 
 function writePidFile(pidFile) {

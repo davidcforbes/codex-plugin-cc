@@ -146,7 +146,7 @@ function runNodeEval(source) {
 test("concurrent upsertJob calls preserve every job record", async () => {
   const workspace = makeTempDir();
   const stateModuleUrl = pathToFileURL(path.resolve("plugins/codex/scripts/lib/state.mjs")).href;
-  const ids = Array.from({ length: 8 }, (_, index) => `job-${index}`);
+  const ids = Array.from({ length: 40 }, (_, index) => `job-${index}`);
 
   await Promise.all(
     ids.map((id) =>
@@ -165,6 +165,6 @@ test("concurrent upsertJob calls preserve every job record", async () => {
     listJobs(workspace)
       .map((job) => job.id)
       .sort(),
-    ids
+    [...ids].sort()
   );
 });

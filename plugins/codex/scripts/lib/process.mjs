@@ -51,11 +51,81 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
 }
 
 function looksLikeMissingProcessMessage(text) {
-  return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
+  return /not found|no running instance|cannot find|does not exist|no such process|no tasks are running/i.test(text);
+}
+
+function normalizePid(pid) {
+  const numericPid = Number(pid);
+  return Number.isInteger(numericPid) && numericPid > 0 ? numericPid : null;
+}
+
+function canSignalProcess(pid, killImpl) {
+  try {
+    killImpl(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return false;
+    }
+    if (error?.code === "EPERM") {
+      return true;
+    }
+    throw error;
+  }
+}
+
+function windowsTasklistOutputContainsPid(output, pid) {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .some((line) => line.split(",").some((cell) => cell.replace(/^"|"$/g, "").trim() === String(pid)));
+}
+
+export function isProcessAlive(pid, options = {}) {
+  const normalizedPid = normalizePid(pid);
+  if (normalizedPid === null) {
+    return false;
+  }
+
+  const platform = options.platform ?? process.platform;
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+
+  if (platform === "win32") {
+    const result = runCommandImpl("tasklist", ["/FI", `PID eq ${normalizedPid}`, "/FO", "CSV", "/NH"], {
+      cwd: options.cwd,
+      env: {
+        ...(options.env ?? process.env),
+        MSYS_NO_PATHCONV: "1"
+      },
+      maxBuffer: 1024 * 1024,
+      shell: false
+    });
+
+    if (result.error?.code === "ENOENT") {
+      return canSignalProcess(normalizedPid, killImpl);
+    }
+    if (result.error) {
+      throw result.error;
+    }
+
+    const combinedOutput = `${result.stdout}\n${result.stderr}`.trim();
+    if (looksLikeMissingProcessMessage(combinedOutput)) {
+      return false;
+    }
+    if (result.status !== 0) {
+      throw new Error(formatCommandFailure(result));
+    }
+    return windowsTasklistOutputContainsPid(combinedOutput, normalizedPid);
+  }
+
+  return canSignalProcess(normalizedPid, killImpl);
 }
 
 export function terminateProcessTree(pid, options = {}) {
-  if (!Number.isFinite(pid)) {
+  const normalizedPid = normalizePid(pid);
+  if (normalizedPid === null) {
     return { attempted: false, delivered: false, method: null };
   }
 
@@ -64,7 +134,7 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
 
   if (platform === "win32") {
-    const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
+    const result = runCommandImpl("taskkill", ["/PID", String(normalizedPid), "/T", "/F"], {
       cwd: options.cwd,
       env: {
         ...(options.env ?? process.env),
@@ -84,7 +154,7 @@ export function terminateProcessTree(pid, options = {}) {
 
     if (result.error?.code === "ENOENT") {
       try {
-        killImpl(pid);
+        killImpl(normalizedPid);
         return { attempted: true, delivered: true, method: "kill" };
       } catch (error) {
         if (error?.code === "ESRCH") {
@@ -103,14 +173,14 @@ export function terminateProcessTree(pid, options = {}) {
 
   if (options.processGroup === true) {
     try {
-      killImpl(-pid, "SIGTERM");
+      killImpl(-normalizedPid, "SIGTERM");
       return { attempted: true, delivered: true, method: "process-group" };
     } catch (error) {
       if (error?.code === "ESRCH") {
         return { attempted: true, delivered: false, method: "process-group" };
       }
       try {
-        killImpl(pid, "SIGTERM");
+        killImpl(normalizedPid, "SIGTERM");
         return { attempted: true, delivered: true, method: "process" };
       } catch (innerError) {
         if (innerError?.code === "ESRCH") {
@@ -122,7 +192,7 @@ export function terminateProcessTree(pid, options = {}) {
   }
 
   try {
-    killImpl(pid, "SIGTERM");
+    killImpl(normalizedPid, "SIGTERM");
     return { attempted: true, delivered: true, method: "process" };
   } catch (error) {
     if (error?.code === "ESRCH") {

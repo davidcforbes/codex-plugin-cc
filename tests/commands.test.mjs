@@ -88,6 +88,9 @@ test("rescue command absorbs continue semantics", () => {
   const agent = read("agents/codex-rescue.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
+  const agentFrontmatter = agent.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  assert.ok(agentFrontmatter);
+  assert.equal(agentFrontmatter[1].match(/^tools:\s*(.+)$/m)?.[1].trim(), "Bash");
 
   assert.match(rescue, /The final user-visible response must be Codex's output verbatim/i);
   assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
@@ -114,6 +117,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
+  assert.match(agent, /Do not call MCP tools such as `serena\/read_file`/i);
   assert.match(rescue, /If the request includes `--resume`, do not ask whether to continue/i);
   assert.match(rescue, /If the request includes `--fresh`, do not ask whether to continue/i);
   assert.match(rescue, /If the user chooses continue, add `--resume`/i);
